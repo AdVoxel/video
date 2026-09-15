@@ -18,7 +18,7 @@ on:
       bitrate:
         description: "Bitrate de vídeo"
         required: true
-        default: "1800k"
+        default: "1500k"
       alpha_quality:
         description: "Qualidade do canal alpha (0-1)"
         required: true
@@ -34,15 +34,21 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Instalar ffmpeg
         run: brew install ffmpeg
 
-      - name: Confirmar VideoToolbox
+      - name: Confirmar suporte a alpha no encoder
         run: |
-          ffmpeg -hide_banner -encoders | grep hevc_videotoolbox \
-            || { echo "::error::hevc_videotoolbox indisponível nesta build"; exit 1; }
+          set -euo pipefail
+          ffmpeg -hide_banner -encoders | grep -q hevc_videotoolbox \
+            || { echo "::error::hevc_videotoolbox indisponível"; exit 1; }
+          FMTS=$(ffmpeg -hide_banner -h encoder=hevc_videotoolbox 2>&1 \
+                 | grep -i "pixel formats" || true)
+          echo "$FMTS"
+          echo "$FMTS" | grep -q bgra \
+            || { echo "::error::esta build não aceita bgra, não consegue alpha"; exit 1; }
 
       - name: Codificar
         env:
@@ -57,35 +63,50 @@ jobs:
           mkdir -p out
           ffmpeg -hide_banner -y -i "$ENTRADA" \
             -vf "chromakey=${COR}:${SIM}:0.05,despill=type=green:mix=0.5:expand=0,format=rgba" \
-            -c:v hevc_videotoolbox -b:v "$BR" -allow_sw 1 -alpha_quality "$AQ" \
+            -c:v hevc_videotoolbox -b:v "$BR" -alpha_quality "$AQ" \
             -pix_fmt bgra -tag:v hvc1 -an \
             out/safari-alpha.mov
 
-      - name: Verificar resultado
+      - name: Verificar alpha, tag e tamanho
         env:
           LIMITE: ${{ inputs.limite_mb }}
         run: |
           set -euo pipefail
           F=out/safari-alpha.mov
-          BYTES=$(stat -f%z "$F")
-          MB=$(echo "scale=2; $BYTES/1048576" | bc)
-          echo "Tamanho: ${MB} MB"
+          test -s "$F" || { echo "::error::ficheiro vazio"; exit 1; }
 
+          PIX=$(ffprobe -v error -select_streams v:0 \
+                -show_entries stream=pix_fmt -of csv=p=0 "$F")
           TAG=$(ffprobe -v error -select_streams v:0 \
                 -show_entries stream=codec_tag_string -of csv=p=0 "$F")
-          echo "Tag do codec: $TAG"
-          [ "$TAG" = "hvc1" ] \
-            || { echo "::error::tag é '$TAG', o Safari precisa de hvc1"; exit 1; }
+          HVCE=$(grep -c hvcE "$F" || true)
+          BYTES=$(stat -f%z "$F")
+          MB=$(echo "scale=2; $BYTES/1048576" | bc)
 
-          echo "### Resultado" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Tamanho: **${MB} MB** (limite ${LIMITE} MB)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "pix_fmt=$PIX  tag=$TAG  hvcE=$HVCE  tamanho=${MB}MB"
+
+          {
+            echo "### Resultado"
+            echo "- pix_fmt: \`$PIX\`"
+            echo "- tag: \`$TAG\`"
+            echo "- camada alpha (hvcE): \`$HVCE\`"
+            echo "- tamanho: **${MB} MB** (limite ${LIMITE} MB)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ "$TAG" = "hvc1" ] \
+            || { echo "::error::tag '$TAG', o Safari precisa de hvc1"; exit 1; }
+          [ "$HVCE" -gt 0 ] \
+            || { echo "::error::sem camada alpha — o ficheiro é opaco"; exit 1; }
+          case "$PIX" in
+            bgra|rgba|yuva*) ;;
+            *) echo "::error::pix_fmt '$PIX' não tem alpha"; exit 1 ;;
+          esac
 
           if (( $(echo "$MB > $LIMITE" | bc -l) )); then
-            echo "::warning::Acima do limite. Baixa o bitrate e volta a correr."
+            echo "::warning::${MB}MB acima do limite — baixa o bitrate e repete."
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: safari-alpha-mov
           path: out/safari-alpha.mov
