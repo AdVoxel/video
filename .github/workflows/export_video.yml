@@ -1,0 +1,92 @@
+name: HEVC alpha para Safari
+
+on:
+  workflow_dispatch:
+    inputs:
+      entrada:
+        description: "Caminho do ficheiro de entrada no repositório"
+        required: true
+        default: "input/entrada.mov"
+      cor:
+        description: "Cor do fundo a remover (hex)"
+        required: true
+        default: "0x0D7A4C"
+      similarity:
+        description: "Tolerância do chromakey"
+        required: true
+        default: "0.10"
+      bitrate:
+        description: "Bitrate de vídeo"
+        required: true
+        default: "1800k"
+      alpha_quality:
+        description: "Qualidade do canal alpha (0-1)"
+        required: true
+        default: "0.65"
+      limite_mb:
+        description: "Tamanho máximo aceite (MB)"
+        required: true
+        default: "3"
+
+jobs:
+  encode:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar ffmpeg
+        run: brew install ffmpeg
+
+      - name: Confirmar VideoToolbox
+        run: |
+          ffmpeg -hide_banner -encoders | grep hevc_videotoolbox \
+            || { echo "::error::hevc_videotoolbox indisponível nesta build"; exit 1; }
+
+      - name: Codificar
+        env:
+          ENTRADA: ${{ inputs.entrada }}
+          COR: ${{ inputs.cor }}
+          SIM: ${{ inputs.similarity }}
+          BR: ${{ inputs.bitrate }}
+          AQ: ${{ inputs.alpha_quality }}
+        run: |
+          set -euo pipefail
+          test -f "$ENTRADA" || { echo "::error::'$ENTRADA' não existe"; exit 1; }
+          mkdir -p out
+          ffmpeg -hide_banner -y -i "$ENTRADA" \
+            -vf "chromakey=${COR}:${SIM}:0.05,despill=type=green:mix=0.5:expand=0,format=rgba" \
+            -c:v hevc_videotoolbox -b:v "$BR" -allow_sw 1 -alpha_quality "$AQ" \
+            -pix_fmt bgra -tag:v hvc1 -an \
+            out/safari-alpha.mov
+
+      - name: Verificar resultado
+        env:
+          LIMITE: ${{ inputs.limite_mb }}
+        run: |
+          set -euo pipefail
+          F=out/safari-alpha.mov
+          BYTES=$(stat -f%z "$F")
+          MB=$(echo "scale=2; $BYTES/1048576" | bc)
+          echo "Tamanho: ${MB} MB"
+
+          TAG=$(ffprobe -v error -select_streams v:0 \
+                -show_entries stream=codec_tag_string -of csv=p=0 "$F")
+          echo "Tag do codec: $TAG"
+          [ "$TAG" = "hvc1" ] \
+            || { echo "::error::tag é '$TAG', o Safari precisa de hvc1"; exit 1; }
+
+          echo "### Resultado" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tamanho: **${MB} MB** (limite ${LIMITE} MB)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+          if (( $(echo "$MB > $LIMITE" | bc -l) )); then
+            echo "::warning::Acima do limite. Baixa o bitrate e volta a correr."
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: safari-alpha-mov
+          path: out/safari-alpha.mov
+          retention-days: 14
